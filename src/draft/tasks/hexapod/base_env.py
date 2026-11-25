@@ -19,6 +19,7 @@ from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp import dr
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.event_manager import EventTermCfg
+from mjlab.managers.observation_manager import ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
@@ -31,6 +32,7 @@ from mjlab.tasks.velocity.velocity_env_cfg import make_velocity_env_cfg
 from mjlab.terrains.config import ROUGH_TERRAINS_CFG
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 
+import draft.tasks.hexapod.gait as gait_mod
 import draft.tasks.quadruped.mdp as q_mdp
 from draft.tasks.hexapod.hexapod_entity import make_hexapod_entity_cfg
 from draft.tasks.hexapod.legs import (
@@ -49,6 +51,9 @@ from draft.tasks.quadruped.quadruped_entity import (
 
 #: Feet the quadruped recipe's per-foot reward weights were calibrated on.
 _QUADRUPED_FEET = 4
+
+#: ``free``: no gait is asked for. ``tripod``: see gait.py.
+GAITS = ("free", "tripod")
 
 
 class BaseCtx:
@@ -105,6 +110,9 @@ def make_base_env_cfg(
     dimensional_weights: bool = False,
     terrain_scan_fix: str = "all",
     per_foot_weights_as_quadruped: bool = False,
+    gait: str = "free",
+    gait_frequency_hz: float = 1.8,
+    gait_reward_weight: float = 1.0,
 ) -> tuple[ManagerBasedRlEnvCfg, BaseCtx]:
     """Shared gentle-terrain natural-gait env cfg + a context object.
 
@@ -117,7 +125,10 @@ def make_base_env_cfg(
     the rewards summed over feet (air_time, foot_clearance) by
     ``_QUADRUPED_FEET / len(FOOT_SITES)``, so six feet earn the same total
     incentive four feet do; off, each foot earns the quadruped's per-foot
-    weight. Settings that change the task must match across
+    weight. ``gait``: ``free`` lets the gait emerge; ``tripod`` adds a stride
+    clock (``gait_frequency_hz``) to the observations and rewards feet for
+    following the tripod schedule (``gait.py``, weight ``gait_reward_weight``).
+    Settings that change the task must match across
     any runs being compared.
     """
     if terrain_scan_fix not in TERRAIN_SCAN_FIXES:
@@ -250,6 +261,21 @@ def make_base_env_cfg(
                           if per_foot_weights_as_quadruped else 1.0)
     cfg.rewards["air_time"].weight *= ctx.per_foot_scale
     cfg.rewards["foot_clearance"].weight *= ctx.per_foot_scale
+
+    # ── Gait: free, or a tripod clock + contact-schedule reward ──────────────
+    if gait not in GAITS:
+        raise ValueError(f"unknown gait {gait!r}; known: {GAITS}")
+    ctx.gait = gait
+    if gait == "tripod":
+        for group in ("actor", "critic"):
+            cfg.observations[group].terms["gait_clock"] = ObservationTermCfg(
+                func=gait_mod.gait_clock, params={"frequency_hz": gait_frequency_hz})
+        cfg.rewards["tripod_contact"] = RewardTermCfg(
+            func=gait_mod.tripod_contact_match, weight=gait_reward_weight,
+            params={"sensor_name": "feet_ground_contact",
+                    "frequency_hz": gait_frequency_hz, "command_name": "twist",
+                    # As air_time's: below this the robot should stand still.
+                    "command_threshold": 0.1 * s_sqrt})
     cfg.rewards["foot_clearance"].params["target_height"] = 0.10 * s
     cfg.rewards["foot_clearance"].params["height_sensor_name"] = "foot_height_scan"
     cfg.rewards["foot_clearance"].params["asset_cfg"].site_names = FOOT_SITES
