@@ -14,3 +14,5 @@ tasks:
     package: quadruped/terrain
   quadruped_velocity:
     package: quadruped/velocity
+  hexapod:
+    package: hexapod

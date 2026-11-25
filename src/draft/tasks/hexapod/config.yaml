@@ -1,0 +1,10 @@
+# Per-run config for the hexapod task. Keys override runner_cfg.py defaults.
+# Designs live in the hexapod-sim repo; build one with
+#   python ../scripts/generate_design.py hexapod_h0     (from draft/, draft env)
+
+task: hexapod
+run_name: hexapod_flat
+
+env_kwargs:
+  robot_xml: ../generated/hexapod_h0/hexapod_h0.xml
+  terrain_scan_fix: all
