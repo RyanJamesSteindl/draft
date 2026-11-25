@@ -47,6 +47,9 @@ from draft.tasks.quadruped.quadruped_entity import (
     REF_INIT_HEIGHT, REF_LEG_LENGTH, measure_max_joint_speed,
 )
 
+#: Feet the quadruped recipe's per-foot reward weights were calibrated on.
+_QUADRUPED_FEET = 4
+
 
 class BaseCtx:
     """Scale factors + reusable ranges shared with the task variants.
@@ -101,6 +104,7 @@ def make_base_env_cfg(
     terrain_scale_with_size: bool = False,
     dimensional_weights: bool = False,
     terrain_scan_fix: str = "all",
+    per_foot_weights_as_quadruped: bool = False,
 ) -> tuple[ManagerBasedRlEnvCfg, BaseCtx]:
     """Shared gentle-terrain natural-gait env cfg + a context object.
 
@@ -109,7 +113,11 @@ def make_base_env_cfg(
     ``ctx.v_max`` (the Froude range need not be reachable by the actuators).
     ``dimensional_weights`` rescales the ``air_time`` and ``action_rate_l2``
     weights to cancel their cost's dimensions. ``terrain_scan_fix``: see
-    :data:`TERRAIN_SCAN_FIXES`. Settings that change the task must match across
+    :data:`TERRAIN_SCAN_FIXES`. ``per_foot_weights_as_quadruped`` scales
+    the rewards summed over feet (air_time, foot_clearance) by
+    ``_QUADRUPED_FEET / len(FOOT_SITES)``, so six feet earn the same total
+    incentive four feet do; off, each foot earns the quadruped's per-foot
+    weight. Settings that change the task must match across
     any runs being compared.
     """
     if terrain_scan_fix not in TERRAIN_SCAN_FIXES:
@@ -236,6 +244,12 @@ def make_base_env_cfg(
     cfg.rewards["air_time"].params["command_threshold"] = 0.1 * s_sqrt
 
     cfg.rewards["foot_clearance"].weight = -2.0 / s**1.5
+    # mjlab's feet_air_time and feet_clearance sum over feet; their weights
+    # were calibrated on four.
+    ctx.per_foot_scale = (_QUADRUPED_FEET / len(FOOT_SITES)
+                          if per_foot_weights_as_quadruped else 1.0)
+    cfg.rewards["air_time"].weight *= ctx.per_foot_scale
+    cfg.rewards["foot_clearance"].weight *= ctx.per_foot_scale
     cfg.rewards["foot_clearance"].params["target_height"] = 0.10 * s
     cfg.rewards["foot_clearance"].params["height_sensor_name"] = "foot_height_scan"
     cfg.rewards["foot_clearance"].params["asset_cfg"].site_names = FOOT_SITES
