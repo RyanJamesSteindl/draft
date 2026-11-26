@@ -17,6 +17,13 @@
   at that height, then the step rate rises, never above the M2 rate at top
   speed. Integrated rather than ``t * f``, so changing ``f`` does not make the
   phase jump. Reset to 0 with each episode.
+- **Body height is measured from the feet** (:func:`support_height`): the
+  trunk's height above the plane through the feet on the ground. It uses only
+  what a real robot measures (joint angles through the kinematics, IMU
+  attitude, which feet are down), so the command means the same thing off
+  the simulator and on soft ground, where the feet sink below the surface a
+  range sensor sees. The terrain-scan height is kept as a logged cross-check
+  (``height_gap``); their disagreement is the soft-ground signal for later.
 
 The tables are plain numbers passed through the run config, so the task does
 not depend on the analysis code that produced them.
@@ -55,6 +62,37 @@ def height_above_terrain(env: "ManagerBasedRlEnv", sensor_name: str = "terrain_s
     return z - torch.nan_to_num(ground, nan=0.0)
 
 
+def support_height(env: "ManagerBasedRlEnv", contact_sensor: str, foot_sites: Sequence[str],
+                   foot_radius: float, held: torch.Tensor,
+                   asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Trunk height above the plane through the feet in contact.
+
+    Foot ground points are the foot-sphere centres less ``foot_radius``,
+    relative to the trunk origin (on a robot: forward kinematics rotated by the
+    IMU attitude). With three or more non-collinear feet down, a least-squares
+    plane z = a + b x + c y (trunk at x = y = 0) gives height ``-a``; with one or
+    two, their mean height; with none, ``held`` (updated in place, NaN until the
+    first contact).
+    """
+    asset = env.scene[asset_cfg.name]
+    ids = [asset.site_names.index(n) for n in foot_sites]
+    rel = asset.data.site_pos_w[:, ids, :] - asset.data.root_link_pos_w[:, None, :]  # [B, F, 3]
+    gz = rel[..., 2] - foot_radius
+    w = (env.scene.sensors[contact_sensor].data.found.reshape(rel.shape[0], -1) > 0).float()
+    n = w.sum(-1)
+    mean = -(w * gz).sum(-1) / n.clamp(min=1)
+    X = torch.stack((torch.ones_like(gz), rel[..., 0], rel[..., 1]), dim=-1)      # [B, F, 3]
+    A = torch.einsum("bf,bfi,bfj->bij", w, X, X)
+    rhs = torch.einsum("bf,bfi,bf->bi", w, X, gz)
+    ok = (n >= 3) & (torch.linalg.det(A).abs() > 1e-6)
+    eye = torch.eye(3, device=A.device).expand_as(A)
+    coef = torch.linalg.solve(torch.where(ok[:, None, None], A, eye), rhs.unsqueeze(-1)).squeeze(-1)
+    h = torch.where(ok, -coef[:, 0], mean)
+    h = torch.where(n > 0, h, held)
+    held.copy_(h)
+    return h
+
+
 def _interp(x: torch.Tensor, xs: torch.Tensor, ys: torch.Tensor) -> torch.Tensor:
     """Piecewise-linear ``ys(x)``, clamped at the ends (``xs`` increasing)."""
     x = x.clamp(xs[0], xs[-1])
@@ -66,8 +104,11 @@ def _interp(x: torch.Tensor, xs: torch.Tensor, ys: torch.Tensor) -> torch.Tensor
 @dataclass(kw_only=True)
 class HeightVelocityCommandCfg(UniformVelocityCommandCfg):
     height_range: tuple[float, float]
-    #: Ray-cast sensor whose hits give the ground under the trunk.
+    #: Ray-cast sensor for the cross-check height (and the fallback before any contact).
     terrain_sensor: str = "terrain_scan"
+    contact_sensor: str = "feet_ground_contact"
+    foot_sites: Sequence[str] = ()
+    foot_radius: float = 0.0
     table_heights: Sequence[float]
     table_top_speed: Sequence[float]
     table_stroke: Sequence[float]
@@ -99,6 +140,15 @@ class HeightVelocityCommand(UniformVelocityCommand):
         self.phase = torch.zeros(self.num_envs, device=self.device)
         self.step_rate = torch.full((self.num_envs,), cfg.min_step_rate, device=self.device)
         self.metrics["error_height"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["height_gap"] = torch.zeros(self.num_envs, device=self.device)
+        self._held = torch.full((self.num_envs,), float("nan"), device=self.device)
+
+    def body_height(self) -> torch.Tensor:
+        """Trunk height above the feet on the ground (see :func:`support_height`);
+        the terrain-scan height until the first contact of an episode."""
+        h = support_height(self._env, self.cfg.contact_sensor, self.cfg.foot_sites,
+                           self.cfg.foot_radius, self._held)
+        return torch.where(torch.isnan(h), height_above_terrain(self._env, self.cfg.terrain_sensor), h)
 
     @property
     def command(self) -> torch.Tensor:
@@ -124,12 +174,15 @@ class HeightVelocityCommand(UniformVelocityCommand):
     def _update_metrics(self) -> None:
         super()._update_metrics()
         steps = self.cfg.resampling_time_range[1] / self._env.step_dt
-        z = height_above_terrain(self._env, self.cfg.terrain_sensor)
+        z = self.body_height()
         self.metrics["error_height"] += torch.abs(z - self.height_command) / steps
+        scan = height_above_terrain(self._env, self.cfg.terrain_sensor)
+        self.metrics["height_gap"] += torch.abs(scan - z) / steps
 
     def reset(self, env_ids):
         extras = super().reset(env_ids)
         self.phase[env_ids] = 0.0
+        self._held[env_ids] = float("nan")
         return extras
 
     def compute(self, dt: float) -> None:
@@ -161,20 +214,17 @@ def speed_stages(env: "ManagerBasedRlEnv", env_ids: torch.Tensor, command_name: 
 
 def commanded_height_exp(env: "ManagerBasedRlEnv", command_name: str, std: float,
                          asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """``exp(-((z - h_cmd) / std)^2)``, z the trunk height above the terrain."""
+    """``exp(-((z - h_cmd) / std)^2)``, z the trunk height above the feet on the ground."""
+    del asset_cfg
     term = env.command_manager.get_term(command_name)
-    z = height_above_terrain(env, term.cfg.terrain_sensor, asset_cfg)
+    z = term.body_height()
     h = term.height_command
     return torch.exp(-torch.square((z - h) / std))
 
 
 def below_commanded_height(env: "ManagerBasedRlEnv", command_name: str, share: float,
-                           floor: float,
-                           asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """Terminate when trunk height above the mean foot is below ``share * h_cmd``
-    (and never above ``floor``), as ``root_height_above_feet_below``."""
-    asset = env.scene[asset_cfg.name]
-    root_z = asset.data.root_link_pos_w[:, 2]
-    feet_z = asset.data.site_pos_w[:, asset_cfg.site_ids, 2].mean(dim=-1)
-    h = env.command_manager.get_term(command_name).height_command
-    return (root_z - feet_z) < torch.clamp(share * h, min=floor)
+                           floor: float) -> torch.Tensor:
+    """Terminate when the trunk is below ``share * h_cmd`` above the feet on the
+    ground (and never above ``floor``)."""
+    term = env.command_manager.get_term(command_name)
+    return term.body_height() < torch.clamp(share * term.height_command, min=floor)

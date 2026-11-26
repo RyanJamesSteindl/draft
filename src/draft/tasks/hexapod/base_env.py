@@ -138,8 +138,8 @@ def make_base_env_cfg(
 
     M3 (all off by default, so M1 configs are unchanged): ``height_range``
     adds a body-height command (``command.py``) that the policy observes, the
-    trunk-height reward follows it (height above the torso terrain scan's
-    median hit; weight 1.0, std 0.08 m x s) and the
+    trunk-height reward follows it (height above the plane through the feet
+    on the ground, command.py; weight 1.0, std 0.08 m x s) and the
     too-low termination becomes half the commanded height (floor 0.12 m x s).
     ``speed_table`` (``heights``, ``top_speed``, ``stroke``, ``step_rate``;
     from the hexapod-sim M2 speed tool) caps the planar speed command at
@@ -259,7 +259,9 @@ def make_base_env_cfg(
             table_heights=speed_table["heights"], table_top_speed=speed_table["top_speed"],
             table_stroke=speed_table["stroke"], table_step_rate=speed_table["step_rate"],
             cap_share=speed_cap_share, speed_fraction=1.0 if play else stages[0][1],
-            terrain_sensor="terrain_scan_ground" if terrain_scan_fix == "reward" else "terrain_scan")
+            terrain_sensor="terrain_scan_ground" if terrain_scan_fix == "reward" else "terrain_scan",
+            contact_sensor="feet_ground_contact", foot_sites=FOOT_SITES,
+            foot_radius=ctx.foot_radius)
         ctx.speed_stages = stages
     elif gait_frequency_hz == "speed":
         raise ValueError("gait_frequency_hz: speed needs height_range (the clock lives there)")
@@ -353,8 +355,7 @@ def make_base_env_cfg(
     if height_range is not None:
         cfg.terminations["base_too_low"] = TerminationTermCfg(
             func=cmd_mod.below_commanded_height,
-            params={"command_name": "twist", "share": 0.5, "floor": 0.12 * s,
-                    "asset_cfg": SceneEntityCfg("robot", site_names=FOOT_SITES)},
+            params={"command_name": "twist", "share": 0.5, "floor": 0.12 * s},
         )
     # out_of_terrain_bounds kept from the base velocity cfg (terrain present).
 
