@@ -12,12 +12,13 @@ as the M0 quadruped control. Diff the two functions to see every change.
 from __future__ import annotations
 
 import math
-from dataclasses import replace
+from dataclasses import fields, replace
 from pathlib import Path
 
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp import dr
 from mjlab.envs.mdp.actions import JointPositionActionCfg
+from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.observation_manager import ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
@@ -32,6 +33,7 @@ from mjlab.tasks.velocity.velocity_env_cfg import make_velocity_env_cfg
 from mjlab.terrains.config import ROUGH_TERRAINS_CFG
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 
+import draft.tasks.hexapod.command as cmd_mod
 import draft.tasks.hexapod.gait as gait_mod
 import draft.tasks.quadruped.mdp as q_mdp
 from draft.tasks.hexapod.hexapod_entity import make_hexapod_entity_cfg
@@ -48,6 +50,7 @@ from draft.tasks.quadruped.base_env import (  # leg-free: shared unchanged
 from draft.tasks.quadruped.quadruped_entity import (
     REF_INIT_HEIGHT, REF_LEG_LENGTH, measure_max_joint_speed,
 )
+from draft.tasks.quadruped.runner_cfg import QuadrupedLocomotionRunnerCfg
 
 #: Feet the quadruped recipe's per-foot reward weights were calibrated on.
 _QUADRUPED_FEET = 4
@@ -111,8 +114,12 @@ def make_base_env_cfg(
     terrain_scan_fix: str = "all",
     per_foot_weights_as_quadruped: bool = False,
     gait: str = "free",
-    gait_frequency_hz: float = 1.8,
+    gait_frequency_hz: float | str = 1.8,
     gait_reward_weight: float = 1.0,
+    height_range: tuple[float, float] | None = None,
+    speed_table: dict | None = None,
+    speed_cap_share: float = 0.8,
+    speed_stages: list[tuple[int, float]] | None = None,
 ) -> tuple[ManagerBasedRlEnvCfg, BaseCtx]:
     """Shared gentle-terrain natural-gait env cfg + a context object.
 
@@ -128,6 +135,17 @@ def make_base_env_cfg(
     weight. ``gait``: ``free`` lets the gait emerge; ``tripod`` adds a stride
     clock (``gait_frequency_hz``) to the observations and rewards feet for
     following the tripod schedule (``gait.py``, weight ``gait_reward_weight``).
+
+    M3 (all off by default, so M1 configs are unchanged): ``height_range``
+    adds a body-height command (``command.py``) that the policy observes, the
+    trunk-height reward follows it (weight 1.0, std 0.08 m x s) and the
+    too-low termination becomes half the commanded height (floor 0.12 m x s).
+    ``speed_table`` (``heights``, ``top_speed``, ``stroke``, ``step_rate``;
+    from the hexapod-sim M2 speed tool) caps the planar speed command at
+    ``speed_cap_share`` of the top speed at the commanded height.
+    ``speed_stages``: ``[iteration, fraction of the cap]`` pairs, raised in
+    order. ``gait_frequency_hz: speed`` ties the tripod clock to the commanded
+    speed and height (needs ``height_range``).
     Settings that change the task must match across
     any runs being compared.
     """
@@ -227,6 +245,22 @@ def make_base_env_cfg(
                                   min(0.6 * v, twist.ranges.lin_vel_y[1]))
         # How much the clamp bit; the tracking-reward width follows it.
         command_scale = twist.ranges.lin_vel_x[1] / wide if wide > 0 else 1.0
+    ctx.height_command = height_range is not None
+    if height_range is not None:
+        if speed_table is None:
+            raise ValueError("height_range needs speed_table (the M2 limits by height)")
+        stages = [(int(it) * QuadrupedLocomotionRunnerCfg.num_steps_per_env, float(fr))
+                  for it, fr in (speed_stages or [(0, 1.0)])]
+        old = cfg.commands["twist"]
+        cfg.commands["twist"] = cmd_mod.HeightVelocityCommandCfg(
+            **{f.name: getattr(old, f.name) for f in fields(old)},
+            height_range=(float(height_range[0]), float(height_range[1])),  # metres, as M2
+            table_heights=speed_table["heights"], table_top_speed=speed_table["top_speed"],
+            table_stroke=speed_table["stroke"], table_step_rate=speed_table["step_rate"],
+            cap_share=speed_cap_share, speed_fraction=1.0 if play else stages[0][1])
+        ctx.speed_stages = stages
+    elif gait_frequency_hz == "speed":
+        raise ValueError("gait_frequency_hz: speed needs height_range (the clock lives there)")
     ctx.command_clamped = clamp_command_to_vmax
     ctx.dimensional_weights = dimensional_weights
     ctx.command_scale = command_scale
@@ -267,13 +301,14 @@ def make_base_env_cfg(
         raise ValueError(f"unknown gait {gait!r}; known: {GAITS}")
     ctx.gait = gait
     if gait == "tripod":
+        freq = None if gait_frequency_hz == "speed" else float(gait_frequency_hz)
         for group in ("actor", "critic"):
             cfg.observations[group].terms["gait_clock"] = ObservationTermCfg(
-                func=gait_mod.gait_clock, params={"frequency_hz": gait_frequency_hz})
+                func=gait_mod.gait_clock, params={"frequency_hz": freq})
         cfg.rewards["tripod_contact"] = RewardTermCfg(
             func=gait_mod.tripod_contact_match, weight=gait_reward_weight,
             params={"sensor_name": "feet_ground_contact",
-                    "frequency_hz": gait_frequency_hz, "command_name": "twist",
+                    "frequency_hz": freq, "command_name": "twist",
                     # As air_time's: below this the robot should stand still.
                     "command_threshold": 0.1 * s_sqrt})
     cfg.rewards["foot_clearance"].params["target_height"] = 0.10 * s
@@ -295,6 +330,10 @@ def make_base_env_cfg(
         func=q_mdp.base_height_exp, weight=0.4,
         params={"target_height": 0.95 * ctx.init_height, "std": 0.25 * ctx.init_height},
     )
+    if height_range is not None:
+        cfg.rewards["base_height"] = RewardTermCfg(
+            func=cmd_mod.commanded_height_exp, weight=1.0,
+            params={"command_name": "twist", "std": 0.08 * s})
     for key in ("pose", "angular_momentum", "body_ang_vel",
                 "foot_swing_height", "foot_slip", "soft_landing"):
         cfg.rewards.pop(key, None)
@@ -309,6 +348,12 @@ def make_base_env_cfg(
         params={"minimum_height": 0.5 * ctx.init_height,
                 "asset_cfg": SceneEntityCfg("robot", site_names=FOOT_SITES)},
     )
+    if height_range is not None:
+        cfg.terminations["base_too_low"] = TerminationTermCfg(
+            func=cmd_mod.below_commanded_height,
+            params={"command_name": "twist", "share": 0.5, "floor": 0.12 * s,
+                    "asset_cfg": SceneEntityCfg("robot", site_names=FOOT_SITES)},
+        )
     # out_of_terrain_bounds kept from the base velocity cfg (terrain present).
 
     # ── Domain randomisation + modest stance-shaping push ─────────────────────
@@ -335,6 +380,10 @@ def make_base_env_cfg(
     # ── Curriculum: none; the base is a fixed task ────────────────────────────
     # ``ctx.base_curriculum`` keeps mjlab's terms for the challenge tasks to reuse.
     cfg.curriculum = {}
+    if height_range is not None:
+        cfg.curriculum["speed_stages"] = CurriculumTermCfg(
+            func=cmd_mod.speed_stages,
+            params={"command_name": "twist", "stages": ctx.speed_stages})
 
     # ── Viewer / envs / episode length ────────────────────────────────────────
     # Camera tracks the torso from above at an oblique angle, distance in leg lengths.

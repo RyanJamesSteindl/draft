@@ -8,6 +8,10 @@ scored within ``tolerance`` of a switch, so touchdown and lift-off need not be
 instantaneous. When the command is (near) zero, all six feet should be down.
 
 The policy sees ``sin, cos`` of the phase, so it knows where in the stride it is.
+
+``frequency_hz=None`` takes the phase from the command term instead
+(``command.py``'s ``HeightVelocityCommand``, which integrates a step rate tied
+to the commanded speed and height); ``clock_command`` names that term.
 """
 
 from __future__ import annotations
@@ -28,22 +32,27 @@ TRIPOD_B = ("right_front", "left_mid", "right_rear")
 _IN_A = torch.tensor([leg in TRIPOD_A for leg in LEGS])
 
 
-def gait_phase(env: "ManagerBasedRlEnv", frequency_hz: float) -> torch.Tensor:
-    """Stride phase in [0, 1), per env, from the episode's elapsed time."""
+def gait_phase(env: "ManagerBasedRlEnv", frequency_hz: float | None,
+               clock_command: str = "twist") -> torch.Tensor:
+    """Stride phase in [0, 1), per env: elapsed time x ``frequency_hz``, or the
+    command term's integrated phase when ``frequency_hz`` is None."""
+    if frequency_hz is None:
+        return env.command_manager.get_term(clock_command).phase
     t = env.episode_length_buf.float() * env.step_dt
     return torch.remainder(t * frequency_hz, 1.0)
 
 
-def gait_clock(env: "ManagerBasedRlEnv", frequency_hz: float) -> torch.Tensor:
+def gait_clock(env: "ManagerBasedRlEnv", frequency_hz: float | None,
+               clock_command: str = "twist") -> torch.Tensor:
     """Observation: ``[sin 2*pi*phase, cos 2*pi*phase]``, shape [B, 2]."""
-    ang = 2.0 * math.pi * gait_phase(env, frequency_hz)
+    ang = 2.0 * math.pi * gait_phase(env, frequency_hz, clock_command)
     return torch.stack((torch.sin(ang), torch.cos(ang)), dim=-1)
 
 
 def tripod_contact_match(
     env: "ManagerBasedRlEnv",
     sensor_name: str,
-    frequency_hz: float,
+    frequency_hz: float | None,
     command_name: str,
     command_threshold: float,
     tolerance: float = 0.05,
@@ -51,7 +60,7 @@ def tripod_contact_match(
     """Reward in [0, 1]: fraction of feet whose contact matches the tripod schedule."""
     found = env.scene.sensors[sensor_name].data.found
     contact = found.reshape(found.shape[0], -1) > 0                     # [B, 6]
-    phase = gait_phase(env, frequency_hz).unsqueeze(-1)                 # [B, 1]
+    phase = gait_phase(env, frequency_hz, command_name).unsqueeze(-1)                 # [B, 1]
     in_a = _IN_A.to(contact.device).unsqueeze(0)                        # [1, 6]
     first_half = phase < 0.5
     want_down = torch.where(in_a, first_half, ~first_half)              # [B, 6]
