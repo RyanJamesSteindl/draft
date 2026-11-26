@@ -38,6 +38,23 @@ if TYPE_CHECKING:
     from mjlab.envs import ManagerBasedRlEnv
 
 
+def height_above_terrain(env: "ManagerBasedRlEnv", sensor_name: str = "terrain_scan",
+                         asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Trunk height above the ground under it: root z minus the median of the
+    torso terrain scan's hits (rays that miss are ignored).
+
+    The terrain is rough and many tiles are raised (pyramid stairs, slopes), so
+    world z is not body height. Fixed 27 Nov after the first M3 pilot, whose
+    world-z reward drove the trunk down onto raised tiles.
+    """
+    z = env.scene[asset_cfg.name].data.root_link_pos_w[:, 2]
+    data = env.scene.sensors[sensor_name].data
+    hit_z = data.hit_pos_w[..., 2]
+    hit_z = torch.where(data.distances >= 0, hit_z, torch.full_like(hit_z, float("nan")))
+    ground = torch.nanmedian(hit_z, dim=-1).values
+    return z - torch.nan_to_num(ground, nan=0.0)
+
+
 def _interp(x: torch.Tensor, xs: torch.Tensor, ys: torch.Tensor) -> torch.Tensor:
     """Piecewise-linear ``ys(x)``, clamped at the ends (``xs`` increasing)."""
     x = x.clamp(xs[0], xs[-1])
@@ -49,6 +66,8 @@ def _interp(x: torch.Tensor, xs: torch.Tensor, ys: torch.Tensor) -> torch.Tensor
 @dataclass(kw_only=True)
 class HeightVelocityCommandCfg(UniformVelocityCommandCfg):
     height_range: tuple[float, float]
+    #: Ray-cast sensor whose hits give the ground under the trunk.
+    terrain_sensor: str = "terrain_scan"
     table_heights: Sequence[float]
     table_top_speed: Sequence[float]
     table_stroke: Sequence[float]
@@ -105,7 +124,7 @@ class HeightVelocityCommand(UniformVelocityCommand):
     def _update_metrics(self) -> None:
         super()._update_metrics()
         steps = self.cfg.resampling_time_range[1] / self._env.step_dt
-        z = self.robot.data.root_link_pos_w[:, 2]
+        z = height_above_terrain(self._env, self.cfg.terrain_sensor)
         self.metrics["error_height"] += torch.abs(z - self.height_command) / steps
 
     def reset(self, env_ids):
@@ -142,9 +161,10 @@ def speed_stages(env: "ManagerBasedRlEnv", env_ids: torch.Tensor, command_name: 
 
 def commanded_height_exp(env: "ManagerBasedRlEnv", command_name: str, std: float,
                          asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """``exp(-((z - h_cmd) / std)^2)`` on world trunk z, as ``base_height_exp``."""
-    z = env.scene[asset_cfg.name].data.root_link_pos_w[:, 2]
-    h = env.command_manager.get_term(command_name).height_command
+    """``exp(-((z - h_cmd) / std)^2)``, z the trunk height above the terrain."""
+    term = env.command_manager.get_term(command_name)
+    z = height_above_terrain(env, term.cfg.terrain_sensor, asset_cfg)
+    h = term.height_command
     return torch.exp(-torch.square((z - h) / std))
 
 
