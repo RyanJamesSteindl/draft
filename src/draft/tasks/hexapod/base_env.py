@@ -120,6 +120,8 @@ def make_base_env_cfg(
     speed_table: dict | None = None,
     speed_cap_share: float = 0.8,
     speed_stages: list[tuple[int, float]] | None = None,
+    height_reward_weight: float = 1.0,
+    height_reward_std: float = 0.08,
 ) -> tuple[ManagerBasedRlEnvCfg, BaseCtx]:
     """Shared gentle-terrain natural-gait env cfg + a context object.
 
@@ -139,7 +141,8 @@ def make_base_env_cfg(
     M3 (all off by default, so M1 configs are unchanged): ``height_range``
     adds a body-height command (``command.py``) that the policy observes, the
     trunk-height reward follows it (height above the plane through the feet
-    on the ground, command.py; weight 1.0, std 0.08 m x s) and the
+    on the ground, command.py; weight ``height_reward_weight``, std
+    ``height_reward_std`` m x s) and the
     too-low termination becomes half the commanded height (floor 0.12 m x s).
     ``speed_table`` (``heights``, ``top_speed``, ``stroke``, ``step_rate``;
     from the hexapod-sim M2 speed tool) caps the planar speed command at
@@ -336,8 +339,8 @@ def make_base_env_cfg(
     )
     if height_range is not None:
         cfg.rewards["base_height"] = RewardTermCfg(
-            func=cmd_mod.commanded_height_exp, weight=1.0,
-            params={"command_name": "twist", "std": 0.08 * s})
+            func=cmd_mod.commanded_height_exp, weight=height_reward_weight,
+            params={"command_name": "twist", "std": height_reward_std * s})
     for key in ("pose", "angular_momentum", "body_ang_vel",
                 "foot_swing_height", "foot_slip", "soft_landing"):
         cfg.rewards.pop(key, None)
