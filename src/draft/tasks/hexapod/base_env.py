@@ -122,6 +122,10 @@ def make_base_env_cfg(
     speed_stages: list[tuple[int, float]] | None = None,
     height_reward_weight: float = 1.0,
     height_reward_std: float = 0.08,
+    gait_duty: float = 0.5,
+    gait_min_support: int = 0,
+    touchdown_weight: float = 0.0,
+    touchdown_alpha: float = 0.1,
 ) -> tuple[ManagerBasedRlEnvCfg, BaseCtx]:
     """Shared gentle-terrain natural-gait env cfg + a context object.
 
@@ -149,7 +153,10 @@ def make_base_env_cfg(
     ``speed_cap_share`` of the top speed at the commanded height.
     ``speed_stages``: ``[iteration, fraction of the cap]`` pairs, raised in
     order. ``gait_frequency_hz: speed`` ties the tripod clock to the commanded
-    speed and height (needs ``height_range``).
+    speed and height (needs ``height_range``). ``gait_duty`` and
+    ``gait_min_support``: overlapping tripods and a support floor (gait.py).
+    ``touchdown_weight`` (0 = off) adds gait.py's touchdown_ground_speed cost
+    (scaled per foot like air_time), target sweep ``touchdown_alpha`` x command.
     Settings that change the task must match across
     any runs being compared.
     """
@@ -316,8 +323,15 @@ def make_base_env_cfg(
             func=gait_mod.tripod_contact_match, weight=gait_reward_weight,
             params={"sensor_name": "feet_ground_contact",
                     "frequency_hz": freq, "command_name": "twist",
+                    "duty": gait_duty, "min_support": gait_min_support,
                     # As air_time's: below this the robot should stand still.
                     "command_threshold": 0.1 * s_sqrt})
+    if touchdown_weight:
+        cfg.rewards["touchdown_ground_speed"] = RewardTermCfg(
+            func=gait_mod.touchdown_ground_speed, weight=-abs(touchdown_weight) * ctx.per_foot_scale,
+            params={"sensor_name": "feet_ground_contact", "height_sensor_name": "foot_height_scan",
+                    "command_name": "twist", "foot_sites": FOOT_SITES, "foot_radius": ctx.foot_radius,
+                    "window": 0.03 * s, "alpha": touchdown_alpha, "v_land": 0.4 * s_sqrt})
     cfg.rewards["foot_clearance"].params["target_height"] = 0.10 * s
     cfg.rewards["foot_clearance"].params["height_sensor_name"] = "foot_height_scan"
     cfg.rewards["foot_clearance"].params["asset_cfg"].site_names = FOOT_SITES
