@@ -126,6 +126,8 @@ def make_base_env_cfg(
     gait_min_support: int = 0,
     touchdown_weight: float = 0.0,
     touchdown_alpha: float = 0.1,
+    support_penalty: float = 0.0,
+    gait_shaping_from: int = 0,
 ) -> tuple[ManagerBasedRlEnvCfg, BaseCtx]:
     """Shared gentle-terrain natural-gait env cfg + a context object.
 
@@ -157,6 +159,10 @@ def make_base_env_cfg(
     ``gait_min_support``: overlapping tripods and a support floor (gait.py).
     ``touchdown_weight`` (0 = off) adds gait.py's touchdown_ground_speed cost
     (scaled per foot like air_time), target sweep ``touchdown_alpha`` x command.
+    ``support_penalty`` (0 = off): gait.py's support_shortfall cost (fewer than
+    3 feet down while moving). ``gait_shaping_from``: the iteration at which
+    the touchdown and support costs switch on (0 = from the start), so the
+    policy learns to walk before the gait is tidied.
     Settings that change the task must match across
     any runs being compared.
     """
@@ -326,9 +332,17 @@ def make_base_env_cfg(
                     "duty": gait_duty, "min_support": gait_min_support,
                     # As air_time's: below this the robot should stand still.
                     "command_threshold": 0.1 * s_sqrt})
+    shaping = {}   # term -> full weight, switched on at gait_shaping_from
+    if support_penalty:
+        shaping["support_shortfall"] = -abs(support_penalty)
+        cfg.rewards["support_shortfall"] = RewardTermCfg(
+            func=gait_mod.support_shortfall, weight=shaping["support_shortfall"],
+            params={"sensor_name": "feet_ground_contact", "command_name": "twist",
+                    "command_threshold": 0.1 * s_sqrt, "min_support": 3})
     if touchdown_weight:
+        shaping["touchdown_ground_speed"] = -abs(touchdown_weight) * ctx.per_foot_scale
         cfg.rewards["touchdown_ground_speed"] = RewardTermCfg(
-            func=gait_mod.touchdown_ground_speed, weight=-abs(touchdown_weight) * ctx.per_foot_scale,
+            func=gait_mod.touchdown_ground_speed, weight=shaping["touchdown_ground_speed"],
             params={"sensor_name": "feet_ground_contact", "height_sensor_name": "foot_height_scan",
                     "command_name": "twist", "foot_sites": FOOT_SITES, "foot_radius": ctx.foot_radius,
                     "window": 0.03 * s, "alpha": touchdown_alpha, "v_land": 0.4 * s_sqrt})
@@ -400,6 +414,14 @@ def make_base_env_cfg(
     # ── Curriculum: none; the base is a fixed task ────────────────────────────
     # ``ctx.base_curriculum`` keeps mjlab's terms for the challenge tasks to reuse.
     cfg.curriculum = {}
+    if shaping and gait_shaping_from > 0:
+        at = int(gait_shaping_from) * QuadrupedLocomotionRunnerCfg.num_steps_per_env
+        for name in shaping:
+            cfg.rewards[name].weight = 0.0 if not play else shaping[name]
+        if not play:
+            cfg.curriculum["gait_shaping"] = CurriculumTermCfg(
+                func=gait_mod.reward_weight_stages,
+                params={"stages": {n: [(0, 0.0), (at, w)] for n, w in shaping.items()}})
     if height_range is not None:
         cfg.curriculum["speed_stages"] = CurriculumTermCfg(
             func=cmd_mod.speed_stages,

@@ -130,3 +130,34 @@ def touchdown_ground_speed(
     env.extras.setdefault("log", {})["Metrics/touchdown_speed_error"] = (
         (near.float() * e_xy.sqrt()).sum() / n)
     return cost
+
+
+def support_shortfall(env: "ManagerBasedRlEnv", sensor_name: str, command_name: str,
+                      command_threshold: float, min_support: int = 3) -> torch.Tensor:
+    """Cost: 1 while moving with fewer than ``min_support`` feet down, else 0.
+
+    The soft form of ``tripod_contact_match``'s ``min_support``: a separate
+    penalty instead of zeroing the whole schedule reward (which, from the
+    start of training, taught M3 pilots ovA/ovB to step in place).
+    """
+    found = env.scene.sensors[sensor_name].data.found
+    contact = found.reshape(found.shape[0], -1) > 0
+    cmd = env.command_manager.get_command(command_name)
+    moving = (torch.norm(cmd[:, :2], dim=1) + torch.abs(cmd[:, 2])) > command_threshold
+    return (moving & (contact.sum(dim=-1) < min_support)).float()
+
+
+def reward_weight_stages(env: "ManagerBasedRlEnv", env_ids: torch.Tensor,
+                         stages: dict[str, list[tuple[int, float]]]) -> dict[str, torch.Tensor]:
+    """Curriculum: set reward term weights from ``(env_step, weight)`` stages, so
+    gait shaping can switch on once the policy walks."""
+    del env_ids
+    out = {}
+    for name, steps in stages.items():
+        cfg = env.reward_manager.get_term_cfg(name)
+        for step, w in steps:
+            if env.common_step_counter >= step:
+                cfg.weight = float(w)
+        out[name] = torch.tensor(cfg.weight)
+    return out
+
