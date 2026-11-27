@@ -127,6 +127,7 @@ def make_base_env_cfg(
     touchdown_weight: float = 0.0,
     touchdown_alpha: float = 0.1,
     support_penalty: float = 0.0,
+    support_gated: bool = False,
     gait_shaping_from: int = 0,
 ) -> tuple[ManagerBasedRlEnvCfg, BaseCtx]:
     """Shared gentle-terrain natural-gait env cfg + a context object.
@@ -160,7 +161,8 @@ def make_base_env_cfg(
     ``touchdown_weight`` (0 = off) adds gait.py's touchdown_ground_speed cost
     (scaled per foot like air_time), target sweep ``touchdown_alpha`` x command.
     ``support_penalty`` (0 = off): gait.py's support_shortfall cost (fewer than
-    3 feet down while moving). ``gait_shaping_from``: the iteration at which
+    3 feet down while moving); ``support_gated`` scales it by the speed-tracking
+    kernel, so stepping in place cannot dodge it. ``gait_shaping_from``: the iteration at which
     the touchdown and support costs switch on (0 = from the start), so the
     policy learns to walk before the gait is tidied.
     Settings that change the task must match across
@@ -338,7 +340,8 @@ def make_base_env_cfg(
         cfg.rewards["support_shortfall"] = RewardTermCfg(
             func=gait_mod.support_shortfall, weight=shaping["support_shortfall"],
             params={"sensor_name": "feet_ground_contact", "command_name": "twist",
-                    "command_threshold": 0.1 * s_sqrt, "min_support": 3})
+                    "command_threshold": 0.1 * s_sqrt, "min_support": 3,
+                    "tracking_term": "track_linear_velocity" if support_gated else None})
     if touchdown_weight:
         shaping["touchdown_ground_speed"] = -abs(touchdown_weight) * ctx.per_foot_scale
         cfg.rewards["touchdown_ground_speed"] = RewardTermCfg(

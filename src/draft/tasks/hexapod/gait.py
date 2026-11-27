@@ -133,18 +133,32 @@ def touchdown_ground_speed(
 
 
 def support_shortfall(env: "ManagerBasedRlEnv", sensor_name: str, command_name: str,
-                      command_threshold: float, min_support: int = 3) -> torch.Tensor:
+                      command_threshold: float, min_support: int = 3,
+                      tracking_term: str | None = None) -> torch.Tensor:
     """Cost: 1 while moving with fewer than ``min_support`` feet down, else 0.
 
     The soft form of ``tripod_contact_match``'s ``min_support``: a separate
     penalty instead of zeroing the whole schedule reward (which, from the
     start of training, taught M3 pilots ovA/ovB to step in place).
+
+    ``tracking_term`` (None = off) names the linear-velocity tracking reward;
+    the cost is then multiplied by that term's own kernel, exp(-err^2 / std^2),
+    so it is charged only in proportion to how well the commanded speed is being
+    followed. Stepping in place no longer dodges it more cheaply than walking:
+    with the cost weight below the tracking weight, walking with a shortfall
+    still scores above standing. (M3 pilots ovD/ovE stalled without this.)
     """
     found = env.scene.sensors[sensor_name].data.found
     contact = found.reshape(found.shape[0], -1) > 0
     cmd = env.command_manager.get_command(command_name)
     moving = (torch.norm(cmd[:, :2], dim=1) + torch.abs(cmd[:, 2])) > command_threshold
-    return (moving & (contact.sum(dim=-1) < min_support)).float()
+    cost = (moving & (contact.sum(dim=-1) < min_support)).float()
+    if tracking_term is not None:
+        std = env.reward_manager.get_term_cfg(tracking_term).params["std"]
+        vel = env.scene["robot"].data.root_link_lin_vel_b
+        err = torch.sum(torch.square(cmd[:, :2] - vel[:, :2]), dim=1) + torch.square(vel[:, 2])
+        cost = cost * torch.exp(-err / std**2)
+    return cost
 
 
 def reward_weight_stages(env: "ManagerBasedRlEnv", env_ids: torch.Tensor,
