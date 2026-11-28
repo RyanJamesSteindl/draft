@@ -128,6 +128,8 @@ def make_base_env_cfg(
     touchdown_alpha: float = 0.1,
     support_penalty: float = 0.0,
     support_gated: bool = False,
+    stance_feet: dict[str, list[float]] | None = None,
+    stance_height: float | None = None,
     gait_shaping_from: int = 0,
 ) -> tuple[ManagerBasedRlEnvCfg, BaseCtx]:
     """Shared gentle-terrain natural-gait env cfg + a context object.
@@ -162,7 +164,10 @@ def make_base_env_cfg(
     (scaled per foot like air_time), target sweep ``touchdown_alpha`` x command.
     ``support_penalty`` (0 = off): gait.py's support_shortfall cost (fewer than
     3 feet down while moving); ``support_gated`` scales it by the speed-tracking
-    kernel, so stepping in place cannot dodge it. ``gait_shaping_from``: the iteration at which
+    kernel, so stepping in place cannot dodge it. ``stance_feet`` (None = the nominal crouch):
+    per-leg foot x, y in the trunk frame for the default pose, solved at ``stance_height``, which
+    also becomes the spawn height (only with a height command, where nothing else reads it).
+    ``gait_shaping_from``: the iteration at which
     the touchdown and support costs switch on (0 = from the start), so the
     policy learns to walk before the gait is tidied.
     Settings that change the task must match across
@@ -178,9 +183,15 @@ def make_base_env_cfg(
 
     cfg = make_velocity_env_cfg()
     # init_height and the nominal stance also come from the task geometry.
+    joint_pos, spawn = None, ctx.init_height
+    if stance_feet is not None:
+        if height_range is None or stance_height is None:
+            raise ValueError("stance_feet needs stance_height and a height command (height_range)")
+        from draft.tasks.hexapod.legs import stance_from_feet
+        joint_pos, spawn = stance_from_feet(robot_xml, stance_feet, stance_height), stance_height
     cfg.scene.entities = {"robot": make_hexapod_entity_cfg(
-        robot_xml, init_height=ctx.init_height,
-        geom_group=None if terrain_scan_fix == "none" else 1)}
+        robot_xml, init_height=spawn,
+        geom_group=None if terrain_scan_fix == "none" else 1, joint_pos=joint_pos)}
 
     # ── Terrain: generator under the gentle ceiling, fixed level band ─────────
     assert cfg.scene.terrain is not None

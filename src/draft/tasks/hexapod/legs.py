@@ -87,6 +87,48 @@ def _soft_range(model: mujoco.MjModel, joint: str, factor: float = 0.9) -> tuple
     return mid - half, mid + half
 
 
+def stance_from_feet(xml_path: Path | str, feet: dict[str, list[float]], height: float) -> dict[str, float]:
+    """Joint angles that put each foot at ``feet[leg]`` (x, y in the trunk frame, metres) with the
+    trunk ``height`` above flat ground, by damped least squares from the nominal crouch.
+
+    Used when a project supplies stance centres (hexapod-sim's foot circle, 28 Nov 2026) instead of
+    the nominal crouch. Raises if a foot is out of reach by more than 5 mm.
+    """
+    model = _load(xml_path)
+    data = mujoco.MjData(model)
+    crouch = default_stance(xml_path)
+    out: dict[str, float] = {}
+    torso = model.body(1)
+    for leg in LEGS:
+        names = [f"{leg}_hip_yaw", f"{leg}_hip_pitch", f"{leg}_knee"]
+        jid = [_id(model, mujoco.mjtObj.mjOBJ_JOINT, n) for n in names]
+        qadr = [model.jnt_qposadr[j] for j in jid]
+        dadr = [model.jnt_dofadr[j] for j in jid]
+        lo = np.array([model.jnt_range[j, 0] for j in jid]); hi = np.array([model.jnt_range[j, 1] for j in jid])
+        site = _id(model, mujoco.mjtObj.mjOBJ_SITE, f"{leg}_foot")
+        radius = float(model.geom_size[_id(model, mujoco.mjtObj.mjOBJ_GEOM, f"{leg}_lower_leg_link_sphere"), 0])
+        target = np.array([feet[leg][0], feet[leg][1], -height + radius])
+        data.qpos[:] = model.qpos0
+        q = np.array([0.0, crouch[".*hip_pitch"], crouch[".*knee"]])
+        jac = np.zeros((3, model.nv))
+        err = np.inf
+        for _ in range(200):
+            data.qpos[qadr] = q
+            mujoco.mj_kinematics(model, data)
+            mujoco.mj_comPos(model, data)
+            e = target - (data.site_xpos[site] - data.xpos[torso.id])
+            err = float(np.linalg.norm(e))
+            if err < 1e-5:
+                break
+            mujoco.mj_jacSite(model, data, jac, None, site)
+            J = jac[:, dadr]
+            q = np.clip(q + J.T @ np.linalg.solve(J @ J.T + 1e-4 * np.eye(3), e), lo, hi)
+        if err > 5e-3:
+            raise ValueError(f"{leg}: stance foot {feet[leg]} at height {height} is {err * 1000:.0f} mm out of reach")
+        out.update({n: float(v) for n, v in zip(names, q)})
+    return out
+
+
 def default_stance(xml_path: Path | str) -> dict[str, float]:
     """The nominal crouch ``knee = -k``, ``hip_pitch = k/2`` (as ``quadruped_entity``'s)."""
     model = _load(xml_path)

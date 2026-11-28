@@ -21,8 +21,10 @@ from draft.tasks.quadruped.speed_limits import _resolve_robot_xml
 
 
 def make_hexapod_entity_cfg(xml_path: Path | str, init_height: float,
-                            geom_group: int | None = None) -> EntityCfg:
-    """As ``make_quadruped_entity_cfg``, for six legs."""
+                            geom_group: int | None = None,
+                            joint_pos: dict[str, float] | None = None) -> EntityCfg:
+    """As ``make_quadruped_entity_cfg``, for six legs. ``joint_pos`` overrides the nominal
+    crouch (the default pose: the reset pose and the actions' zero)."""
     xml_path = _resolve_robot_xml(Path(xml_path))
     captured = xml_path
     return EntityCfg(
@@ -33,7 +35,7 @@ def make_hexapod_entity_cfg(xml_path: Path | str, init_height: float,
         ),
         init_state=EntityCfg.InitialStateCfg(
             pos=(0.0, 0.0, init_height),
-            joint_pos=default_stance(xml_path),
+            joint_pos=joint_pos if joint_pos is not None else default_stance(xml_path),
             joint_vel={".*": 0.0},
         ),
         collisions=(_TERRAIN_COLLISION,),
